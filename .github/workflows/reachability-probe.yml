@@ -1,0 +1,23 @@
+name: reachability-probe
+
+# 境外可达性探测：只测网络能不能通，不采集、不部署。
+# 目的是验证 GitHub（境外）的服务器能否访问这些国内源站。
+on:
+  workflow_dispatch:        # 只在手动点击时运行
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 探测全部站点可达性
+        run: python probe.py

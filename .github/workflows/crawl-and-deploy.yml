@@ -1,0 +1,68 @@
+name: crawl-and-deploy
+
+# 每 30 分钟采集一次全部来源站，产出 live_all.json 并部署到 Surge。
+# 跑在 GitHub 的服务器上，用户本机关机也照常运行。
+on:
+  schedule:
+    # GitHub 的 cron 用 UTC。每 30 分钟一次（0 和 30 分）。
+    # 注意：GitHub 排队繁忙时可能延迟 5-15 分钟，属正常。
+    - cron: '*/30 * * * *'
+  workflow_dispatch:        # 支持手动触发（Actions 页面点 Run workflow）
+
+# 防止上一轮没跑完就叠加下一轮
+concurrency:
+  group: crawl-deploy
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25          # 采集正常约 1 分钟，给足余量
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 采集 68 站实时库存
+        env:
+          PG_SITES_JSON: ${{ github.workspace }}/sites.json
+          PG_OUT_FILE: ${{ github.workspace }}/dist/live_all.json
+        run: |
+          mkdir -p dist
+          python crawler.py
+
+      - name: 校验产物
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          p = 'dist/live_all.json'
+          if not os.path.isfile(p):
+              sys.exit('产物不存在：' + p)
+          j = json.load(open(p, encoding='utf-8'))
+          sites = j.get('sites') or 0
+          items = j.get('total_items') or 0
+          print('站点 %d / 商品 %d / 时间 %s' % (sites, items, j.get('scraped_at')))
+          # 兜底：采到的站太少说明网络出了问题，别把坏数据推上线
+          if sites < 40 or items < 2000:
+              sys.exit('采集结果异常（站点或商品数过少），中止部署')
+          PY
+
+      - name: 组装发布目录（页面 + 新快照）
+        run: |
+          mkdir -p site
+          # 静态资源从仓库里的 site-src 复制（页面 / 商品库 / 图标等）
+          cp -r site-src/. site/
+          # 用刚采到的新快照覆盖旧的
+          cp dist/live_all.json site/live_all.json
+          ls -la site/ | head -20
+
+      - name: 部署到 Surge
+        env:
+          SURGE_TOKEN: ${{ secrets.SURGE_TOKEN }}
+        run: |
+          npx --yes surge@0.44.3 site pinggai-bijia.surge.sh

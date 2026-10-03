@@ -1,0 +1,5 @@
+# 采集产物由 workflow 现场生成，不进仓库
+/dist/
+/site/
+__pycache__/
+*.pyc

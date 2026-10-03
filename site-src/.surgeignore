@@ -1,0 +1,5 @@
+*.bak*
+*.bak
+*.tmp
+share-card.png
+lib/

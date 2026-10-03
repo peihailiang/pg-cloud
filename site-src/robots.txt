@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://qr-code-batch.surge.sh/sitemap.xml
