@@ -1,0 +1,57 @@
+name: probe-once
+
+# 临时工作流：推送即跑一次境外可达性探测，并把结果写回仓库。
+# 目的：本机看不到 Actions 的运行日志（读日志要 API token），
+# 所以让 runner 把结果 commit 回来，本地 git pull 就能读到。
+# 验证完境外能否访问国内源站后即可删除本文件。
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: probe-once
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 记录出口 IP 与地理位置
+        run: |
+          echo "=== runner 出口信息 ===" | tee probe-result.txt
+          curl -s -m 20 https://api.ipify.org 2>&1 | tee -a probe-result.txt || echo "(取出口 IP 失败)" | tee -a probe-result.txt
+          echo | tee -a probe-result.txt
+          curl -s -m 20 https://ipinfo.io/json 2>&1 | tee -a probe-result.txt || echo "(取地理信息失败)" | tee -a probe-result.txt
+          echo | tee -a probe-result.txt
+
+      - name: 探测全部站点可达性
+        continue-on-error: true
+        run: |
+          echo "=== 探测结果 ===" | tee -a probe-result.txt
+          python probe.py 2>&1 | tee -a probe-result.txt || echo "(probe.py 非 0 退出)" | tee -a probe-result.txt
+
+      - name: 把结果写回仓库
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add probe-result.txt
+          if git diff --cached --quiet; then
+            echo "结果无变化，跳过提交"
+          else
+            git commit -m "probe: 境外可达性结果 $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi
