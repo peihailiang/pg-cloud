@@ -31,20 +31,25 @@ jobs:
           python-version: '3.12'
 
       - name: 记录出口 IP 与地理位置
+        continue-on-error: true
         run: |
-          echo "=== runner 出口信息 ===" | tee probe-result.txt
-          curl -s -m 20 https://api.ipify.org 2>&1 | tee -a probe-result.txt || echo "(取出口 IP 失败)" | tee -a probe-result.txt
-          echo | tee -a probe-result.txt
-          curl -s -m 20 https://ipinfo.io/json 2>&1 | tee -a probe-result.txt || echo "(取地理信息失败)" | tee -a probe-result.txt
-          echo | tee -a probe-result.txt
+          echo "=== runner 出口信息 ===" > probe-result.txt
+          echo -n "出口 IP: " >> probe-result.txt
+          curl -s -m 20 https://api.ipify.org >> probe-result.txt || echo "(取出口 IP 失败)" >> probe-result.txt
+          echo >> probe-result.txt
+          echo "地理信息:" >> probe-result.txt
+          curl -s -m 20 https://ipinfo.io/json >> probe-result.txt || echo "(取地理信息失败)" >> probe-result.txt
+          echo >> probe-result.txt
 
       - name: 探测全部站点可达性
         continue-on-error: true
         run: |
-          echo "=== 探测结果 ===" | tee -a probe-result.txt
-          python probe.py 2>&1 | tee -a probe-result.txt || echo "(probe.py 非 0 退出)" | tee -a probe-result.txt
+          echo "=== 探测结果 ===" >> probe-result.txt
+          python probe.py >> probe-result.txt 2>&1 || echo "(probe.py 非 0 退出)" >> probe-result.txt
 
       - name: 把结果写回仓库
+        if: always()
+        continue-on-error: true
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -53,5 +58,7 @@ jobs:
             echo "结果无变化，跳过提交"
           else
             git commit -m "probe: 境外可达性结果 $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            git push
+            git push || echo "(git push 失败：可能是仓库 Workflow permissions 为只读)" 
           fi
+          echo "=== 结果全文（也打到日志里备用）==="
+          cat probe-result.txt
