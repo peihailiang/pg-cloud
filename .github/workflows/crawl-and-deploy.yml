@@ -63,6 +63,9 @@ jobs:
         env:
           PG_SITES_JSON: ${{ github.workspace }}/sites.json
           PG_OUT_FILE: ${{ github.workspace }}/dist/live_all.json
+          # 2026-10-06：置 1 让采集器切到「境外网络」参数（14 并发 / 30s 超时 / 二次重试）。
+          # 境外 runner 到国内源站往返慢，本机那套 20 并发 / 20s 会批量超时。
+          PG_CLOUD: '1'
         run: |
           mkdir -p dist
           python crawler.py
@@ -83,14 +86,17 @@ jobs:
               sys.exit('采集结果异常（站点或商品数过少），中止部署')
           PY
 
-      - name: 组装发布目录（页面 + 新快照）
+      - name: 组装发布目录（页面 + 商品库 + 新快照）
         run: |
           mkdir -p site
           # 静态资源从仓库里的 site-src 复制（页面 / 商品库 / 图标等）
           cp -r site-src/. site/
           # 用刚采到的新快照覆盖旧的
           cp dist/live_all.json site/live_all.json
-          ls -la site/ | head -20
+          echo "--- 发布目录 ---"
+          ls -la site/
+          echo "--- data.js 指纹（必须与 site-src 里的一致：本机是它的唯一维护者）---"
+          md5sum site/data.js site-src/data.js
 
       - name: 部署到 Surge
         env:

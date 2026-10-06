@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
-# 2026-10-06：境外可达性已验证（GitHub runner 美国出口，68 站可达 67，99%），
-# 本采集器已迁移至 GitHub Actions 定时运行，本机关机不影响数据更新。
+# 2026-10-06：本采集器同时供两处运行 ——
+#   · 本机（services/crawl_all.py，由 sh_sites_server.js 每 30 分钟 spawn）
+#   · 云端（pg-cloud/crawler.py，GitHub Actions 每 30 分钟，本机关机不影响）
+# 两处内容必须保持一致（云端版另有几处「境外网络」专属参数，见下面标注）。
 """
 瓶盖比价网 —— 全站采集器（69 站，纯实时抓源站，不用任何第三方聚合源）
 
@@ -53,7 +55,6 @@
   python crawl_all.py --verify       # 对 haoquanyi 逐商品复核精确库存（慢）
 """
 import base64
-import datetime
 import http.cookiejar
 import json
 import os
@@ -65,13 +66,25 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ---- 2026-10-04 关键修复：强制 stdout/stderr 用 UTF-8 ----
+# 本脚本会被「守护进程拉起的服务」在无人值守环境下 spawn，那时 stdout 继承的是
+# 中文 Windows 默认编码 GBK(cp936)。脚本里打印的 ✓ ✗ ⟳ ¥ 四个符号 GBK 编不出来，
+# 会抛 UnicodeEncodeError 直接退出（exit 1），且发生在「写文件」之前 →
+# live_all.json 永不更新、也不会部署。实测：PYTHONIOENCODING=gbk 时必崩。
+# 这里显式重设编码，无论被谁、在什么环境下调用都安全。
+for _s in ("stdout", "stderr"):
+    try:
+        getattr(sys, _s).reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 # 路径可用环境变量覆盖，便于在云端（GitHub Actions）跑：
 #   PG_SITES_JSON=./sites.json   PG_OUT_FILE=./dist/live_all.json
 SITES_JSON = os.environ.get("PG_SITES_JSON") or os.path.join(ROOT, "lib", "sites.json")
 OUT_FILE = os.environ.get("PG_OUT_FILE") or os.path.join(ROOT, "bijia-site", "live_all.json")
 OUT_DIR = os.path.dirname(OUT_FILE)
-# 若 lib/sites.json 不存在（云端仓库把清单放在根目录），自动回退到 ./sites.json
+# 云端仓库把站点清单放在根目录，lib/ 不存在时自动回退
 if not os.path.isfile(SITES_JSON):
     _alt = os.path.join(ROOT, "sites.json")
     if os.path.isfile(_alt):
@@ -81,12 +94,15 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 
 # 等待型任务（纯 HTTP）用线程池。
-# 2026-10-06：境外 runner 出口（美国）到国内源站的往返明显更慢，
-# 20 并发会互相抢带宽、批量超时，实测商品数掉到本机的 78%。
-# 降到 14 并发 + 更长的单次等待，再对失败站点做一轮低并发重试。
-SITE_WORKERS = 14
-ITEM_WORKERS = 12
-RETRY_WORKERS = 4        # 二次重试：低并发，避免再次互相拖垮
+# 2026-10-06：境外 runner 出口（美国）到国内源站往返明显更慢，
+# 20 并发会互相抢带宽、批量超时（实测商品数掉到本机的 78%）。
+# 云端因此降到 14 并发 + 更长的单次等待，并对失败站点再做一轮低并发重试。
+CLOUD = (os.environ.get("PG_CLOUD") == "1")
+SITE_WORKERS = 14 if CLOUD else 20
+ITEM_WORKERS = 12 if CLOUD else 16
+RETRY_WORKERS = 4          # 二次重试：低并发，避免再次互相拖垮
+HTTP_TIMEOUT = 30 if CLOUD else 20
+HTTP_TRIES = 4 if CLOUD else 3
 
 _ctx = ssl.create_default_context()
 _ctx.check_hostname = False
@@ -96,11 +112,11 @@ GATEWAYS = {1: "https://niu2.eaqian.cn", 2: "https://xg2.eayous1.com",
             3: "https://niu2.eaqian.cn", 4: "https://xg2.eayous1.com"}
 
 
-def _open(req, timeout=30):          # 2026-10-06：境外网络往返慢，20s 太紧
+def _open(req, timeout=HTTP_TIMEOUT):
     return urllib.request.urlopen(req, timeout=timeout, context=_ctx)
 
 
-def http_get(url, timeout=30, extra_headers=None, tries=4):
+def http_get(url, timeout=HTTP_TIMEOUT, extra_headers=None, tries=HTTP_TRIES):
     """GET，带退避重试。源站（尤其大水）偶发 502/超时，重试一次往往就好了，
     否则整站 100+ 商品会因一次抖动全丢。"""
     h = {"User-Agent": UA}
@@ -117,7 +133,7 @@ def http_get(url, timeout=30, extra_headers=None, tries=4):
     raise last
 
 
-def http_post(url, data=None, timeout=30, json_body=None, extra_headers=None):
+def http_post(url, data=None, timeout=HTTP_TIMEOUT, json_body=None, extra_headers=None):
     h = {"User-Agent": UA}
     h.update(extra_headers or {})
     if json_body is not None:
@@ -334,43 +350,82 @@ def crawl_sdfaka(site):
 
 # --------------------------------------------------------------- qingtian
 def crawl_qingtian(site):
-    """1 站：静态 HTML 渲染，解析「商品名 ￥ 价格 已售N件」；库存不公开 → -1"""
+    """1 站（晴天 a11.a6qt.cn）：商品清单在首页，**库存只在商品详情页**。
+
+    2026-10-04 两处修正（原实现有 bug）：
+      1) gid 原用 `str(abs(hash(商品名)) % 1e8)` —— CPython 字符串 hash 每进程带随机盐，
+         gid **每轮采集都会变** → 前端 live_all.json 快照永远匹配不上底包/上一轮的数据。
+         现改用商品自己的 id（首页卡片里的 /pg/<id>.html），稳定且与底包里的编号一致。
+      2) 原实现直接给 stock = -1「不公开」—— 实测**详情页明确写着**「库存：<span>N</span>个」。
+         现逐商品抓详情页取真实库存（65 商品并行约 6 秒，可接受）。
+    """
     host, proto = site["host"], "http"
     base = "%s://%s" % (proto, host)
     html = http_get(base + "/pbn.html", timeout=20).decode("utf-8", "ignore")
-    # 去掉脚本/样式/全部标签，得到纯文本流
-    body = re.sub(r"<script.*?</script>", " ", html, flags=re.S)
-    body = re.sub(r"<style.*?</style>", " ", body, flags=re.S)
-    body = re.sub(r"<[^>]+>", "\n", body)
-    body = re.sub(r"[ \t\u00a0]+", " ", body)
-    body = re.sub(r"\n+", "\n", body)
-    # 商品卡片：名称 ... ￥ 价格 ... 已售N件
-    out = []
+
+    cards = []
     seen = set()
-    for m in re.finditer(
-            r"([^<>￥]{4,90}?)\s*[￥¥]\s*([0-9]+(?:\.[0-9]{1,2})?)\s*[^<>]{0,20}?已售\s*(\d+)\s*件",
-            body):
-        name = re.sub(r"\s+", " ", m.group(1)).strip(" 　·|")
-        if len(name) < 4:
+    for m in re.finditer(r"<li\b[^>]*>(.*?)</li>", html, re.S):
+        c = m.group(1)
+        mid = re.search(r"/pg/(\d+)\.html", c)
+        if not mid:
+            continue                      # /pbg/ 之类不是普通商品，跳过
+        pid = mid.group(1)
+        if pid in seen:
             continue
+        mn = re.search(r'class="elli"[^>]*>\s*<a[^>]*>(.*?)</a>', c, re.S)
+        name = re.sub(r"<[^>]+>", "", mn.group(1)).strip() if mn else ""
+        name = re.sub(r"\s+", " ", name)
+        if len(name) < 2:
+            continue
+        mp = re.search(r'class="price"[^>]*>\s*[￥¥]\s*<span>\s*([0-9]+(?:\.[0-9]{1,2})?)\s*</span>', c)
         try:
-            price = float(m.group(2))
+            price = float(mp.group(1)) if mp else 0.0
         except Exception:
+            price = 0.0
+        if price <= 0 or price > 99999:
             continue
-        if price <= 0 or price > 999:
-            continue
-        gid = str(abs(hash(name)) % 100000000)
-        if gid in seen:
-            continue
-        seen.add(gid)
+        ms = re.search(r"已售\s*(\d+)\s*件", c)
+        seen.add(pid)
+        cards.append({
+            "gid": pid, "title": name, "price": price,
+            "sales": int(ms.group(1) or 0) if ms else 0,
+            "url": "%s/pg/%s.html" % (base, pid),
+            "stock": -1,
+        })
+
+    def _stock(it):
+        """抓商品详情页库存。实测页面有 **3 种展示形态**（2026-10-04 全量核对）：
+
+          · 「库存：<span>5041</b>个」                    → 真实数字
+          · 「库存：<span>0</b>个」                       → 售罄（0）
+          · 「库存：<span style=...>库存充足</span>」      → 超过阈值不显示数字
+
+        第 3 种若只写 `\\d+` 会匹配失败 → 退成 -1 → 前端显示「库存不公开」；
+        而底包 data.js 里这类商品标的是 **9999**（语义=库存充足），且基本都是虚拟商品
+        （流量卡/会员/交流群/售后须知/代看服务）。所以这里同样映射为 9999，保持口径一致。
+        """
+        try:
+            page = http_get(it["url"], timeout=20, tries=2).decode("utf-8", "ignore")
+            m = re.search(r"库存：\s*<span[^>]*>\s*(\d+)", page)
+            if m:
+                it["stock"] = int(m.group(1))
+            elif "库存充足" in page:
+                it["stock"] = 9999
+        except Exception:
+            pass
+        return it
+
+    if cards:
+        with ThreadPoolExecutor(max_workers=ITEM_WORKERS) as ex:
+            list(ex.map(_stock, cards))
+
+    out = []
+    for it in cards:
         out.append({
-            "gid": gid,
-            "title": name,
-            "price": price,
-            "stock": -1,          # -1 = 该站不公开库存
-            "sales": int(m.group(3) or 0),
-            "status": 1,
-            "url": base + "/pbn.html",
+            "gid": it["gid"], "title": it["title"], "price": it["price"],
+            "stock": it["stock"], "sales": it["sales"], "status": 1,
+            "url": it["url"],
         })
     return out, "晴天云商城"
 
@@ -440,17 +495,19 @@ def main():
     t0 = time.time()
     result = {}
     stats = {}
-    reused = [0]                 # 用列表承载，便于嵌套函数里累加
-    def run_batch(targets, workers):
-        """采一批站点，返回本批「既没采到、也没有上一轮可沿用」的站点。
+    reused = [0]                       # 用列表承载，便于嵌套函数里累加
+    bad_sites = []                     # 本批「既没采到、也没有上一轮可沿用」的站点
+
+    def run_batch(targets, workers, is_retry=False):
+        """采一批站点。
 
         2026-10-06：抽成函数是为了支持失败站点的二次重试 ——
-        GitHub runner 每轮都是全新环境，dist/ 不进仓库，load_prev() 恒为空，
-        于是「沿用上一轮」这条护栏在云端完全失效，失败的站点直接整站丢失
-        （本机 5281 条 → 云端 4144 条，差的就是这些）。补一轮低并发重试
-        能把大部分临时性超时救回来。
+        云端 runner 每轮都是全新环境，dist/ 不进仓库，load_prev() 恒为空，
+        于是「沿用上一轮」这条护栏在云端完全失效，失败的站点直接整站丢失。
+        补一轮低并发重试能把大部分临时性超时救回来。
+        本机同样受益（源站偶发 502 时不必等到下一轮）。
         """
-        bad = []
+        local_bad = []
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {ex.submit(crawl_site, s, verify): s for s in targets}
             for fu in as_completed(futs):
@@ -483,7 +540,7 @@ def main():
                         print("  ⟳ %-20s %-10s %5d 条  （沿用上一轮）%s"
                               % (site["host"], p, len(old["items"]), err or ""))
                         continue
-                    bad.append(site)
+                    local_bad.append(site)      # 既没数据也没旧值 → 待重试
                 result[key] = {
                     "site": sname or site["name"],
                     "program": site["program"],
@@ -500,14 +557,14 @@ def main():
                     stats[p]["ok"] += 1
                     stats[p]["items"] += len(items)
                     print("  ✓ %-20s %-10s %5d 条  %s" % (site["host"], p, len(items), sname or ""))
-        return bad
+        return local_bad
 
-    bad = run_batch(sites, SITE_WORKERS)
-    if bad:
-        print("\n=== 二次重试：%d 个失败站点（低并发 + 更宽松的等待）===" % len(bad))
-        bad2 = run_batch(bad, RETRY_WORKERS)
-        if bad2:
-            print("  仍失败 %d 站：%s" % (len(bad2), ", ".join(s["host"] for s in bad2)))
+    bad_sites = run_batch(sites, SITE_WORKERS)
+    if bad_sites:
+        print("\n=== 二次重试：%d 个失败站点（低并发 + 更宽松的等待）===" % len(bad_sites))
+        still = run_batch(bad_sites, RETRY_WORKERS, is_retry=True)
+        if still:
+            print("  仍失败 %d 站：%s" % (len(still), ", ".join(s["host"] for s in still)))
 
     print("\n=== 汇总（%.1fs）===" % (time.time() - t0))
     total = 0
@@ -519,11 +576,7 @@ def main():
         print("  其中 %d 站沿用上一轮（源站临时不可用）" % reused[0])
 
     out = {
-        # 2026-10-06：统一按北京时间（UTC+8）落时间。
-        # 原来用系统本地时间，GitHub runner 是 UTC → 网站显示比实际早 8 小时，
-        # 看起来像"数据旧了半天"。用 utcnow()+8h，本机与云端结果一致。
-        "scraped_at": (datetime.datetime.utcnow()
-                       + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S"),
+        "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "ts": int(time.time() * 1000),
         "sites": len(result),
         "total_items": total,
