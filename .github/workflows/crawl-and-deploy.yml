@@ -36,6 +36,29 @@ jobs:
         with:
           python-version: '3.12'
 
+      # 2026-10-06：13 个源站对境外 IP 只让连通、不给数据（返回 456/403/502），
+      # 云端采不到它们。runner 每轮都是全新环境，dist/ 又不进仓库，
+      # 于是 crawler.py 里「失败站点沿用上一轮」的护栏在云端完全失效 → 整站归零。
+      # 这里用 cache 把上一轮产物带回来；首次运行没有缓存时，用仓库内的种子快照兜底。
+      - name: 取回上一轮快照
+        uses: actions/cache@v4
+        with:
+          path: dist/live_all.json
+          key: live-all-${{ github.run_id }}
+          restore-keys: |
+            live-all-
+
+      - name: 无缓存时用种子快照初始化
+        run: |
+          mkdir -p dist
+          if [ ! -s dist/live_all.json ]; then
+            echo "无上一轮缓存 → 用仓库内的种子快照初始化（含境外采不到的那些站）"
+            cp seed-live.json dist/live_all.json
+          else
+            echo "已取回上一轮快照"
+            ls -la dist/live_all.json
+          fi
+
       - name: 采集 68 站实时库存
         env:
           PG_SITES_JSON: ${{ github.workspace }}/sites.json
