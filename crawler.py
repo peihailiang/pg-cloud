@@ -53,6 +53,7 @@
   python crawl_all.py --verify       # 对 haoquanyi 逐商品复核精确库存（慢）
 """
 import base64
+import datetime
 import http.cookiejar
 import json
 import os
@@ -79,9 +80,13 @@ if not os.path.isfile(SITES_JSON):
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 
-# 等待型任务（纯 HTTP）用线程池；69 站并发 20 足够快且不压垮源站
-SITE_WORKERS = 20
-ITEM_WORKERS = 16
+# 等待型任务（纯 HTTP）用线程池。
+# 2026-10-06：境外 runner 出口（美国）到国内源站的往返明显更慢，
+# 20 并发会互相抢带宽、批量超时，实测商品数掉到本机的 78%。
+# 降到 14 并发 + 更长的单次等待，再对失败站点做一轮低并发重试。
+SITE_WORKERS = 14
+ITEM_WORKERS = 12
+RETRY_WORKERS = 4        # 二次重试：低并发，避免再次互相拖垮
 
 _ctx = ssl.create_default_context()
 _ctx.check_hostname = False
@@ -91,11 +96,11 @@ GATEWAYS = {1: "https://niu2.eaqian.cn", 2: "https://xg2.eayous1.com",
             3: "https://niu2.eaqian.cn", 4: "https://xg2.eayous1.com"}
 
 
-def _open(req, timeout=20):
+def _open(req, timeout=30):          # 2026-10-06：境外网络往返慢，20s 太紧
     return urllib.request.urlopen(req, timeout=timeout, context=_ctx)
 
 
-def http_get(url, timeout=20, extra_headers=None, tries=3):
+def http_get(url, timeout=30, extra_headers=None, tries=4):
     """GET，带退避重试。源站（尤其大水）偶发 502/超时，重试一次往往就好了，
     否则整站 100+ 商品会因一次抖动全丢。"""
     h = {"User-Agent": UA}
@@ -112,7 +117,7 @@ def http_get(url, timeout=20, extra_headers=None, tries=3):
     raise last
 
 
-def http_post(url, data=None, timeout=20, json_body=None, extra_headers=None):
+def http_post(url, data=None, timeout=30, json_body=None, extra_headers=None):
     h = {"User-Agent": UA}
     h.update(extra_headers or {})
     if json_body is not None:
@@ -435,54 +440,74 @@ def main():
     t0 = time.time()
     result = {}
     stats = {}
-    reused = 0
-    with ThreadPoolExecutor(max_workers=SITE_WORKERS) as ex:
-        futs = {ex.submit(crawl_site, s, verify): s for s in sites}
-        for fu in as_completed(futs):
-            site, items, sname, err = fu.result()
-            key = site["host"]
-            # 2026-10-04 瘦身：页面只按 host|gid 匹配，取 price/stock 两个值。
-            # 原样存 title/api/class/url 会让产物膨胀到 1.1MB+，经 8777 的 chunked
-            # 传输会被截断（实测浏览器只收到 842KB → JSON 解析失败 → 前端静默跳过），
-            # 因此这里只落最小字段集。
-            slim = []
-            for it in items:
-                g = it.get("gid")
-                if g is None or g == "":
-                    continue
-                slim.append({
-                    "gid": str(g),
-                    "price": it.get("price"),
-                    "stock": it.get("stock"),
-                })
-            # 失败或采到空 → 沿用上一轮（宁可给略旧的实时值，也不退回 data.js 陈旧快照）
-            if not slim:
-                old = prev.get(key)
-                if old and old.get("items"):
-                    result[key] = old
-                    reused += 1
-                    p = site["program"]
-                    stats.setdefault(p, {"ok": 0, "fail": 0, "items": 0})
+    reused = [0]                 # 用列表承载，便于嵌套函数里累加
+    def run_batch(targets, workers):
+        """采一批站点，返回本批「既没采到、也没有上一轮可沿用」的站点。
+
+        2026-10-06：抽成函数是为了支持失败站点的二次重试 ——
+        GitHub runner 每轮都是全新环境，dist/ 不进仓库，load_prev() 恒为空，
+        于是「沿用上一轮」这条护栏在云端完全失效，失败的站点直接整站丢失
+        （本机 5281 条 → 云端 4144 条，差的就是这些）。补一轮低并发重试
+        能把大部分临时性超时救回来。
+        """
+        bad = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(crawl_site, s, verify): s for s in targets}
+            for fu in as_completed(futs):
+                site, items, sname, err = fu.result()
+                key = site["host"]
+                # 2026-10-04 瘦身：页面只按 host|gid 匹配，取 price/stock 两个值。
+                # 原样存 title/api/class/url 会让产物膨胀到 1.1MB+，经 8777 的 chunked
+                # 传输会被截断（实测浏览器只收到 842KB → JSON 解析失败 → 前端静默跳过），
+                # 因此这里只落最小字段集。
+                slim = []
+                for it in items:
+                    g = it.get("gid")
+                    if g is None or g == "":
+                        continue
+                    slim.append({
+                        "gid": str(g),
+                        "price": it.get("price"),
+                        "stock": it.get("stock"),
+                    })
+                # 失败或采到空 → 沿用上一轮（宁可给略旧的实时值，也不退回 data.js 陈旧快照）
+                if not slim:
+                    old = prev.get(key)
+                    if old and old.get("items"):
+                        result[key] = old
+                        reused[0] += 1
+                        p = site["program"]
+                        stats.setdefault(p, {"ok": 0, "fail": 0, "items": 0})
+                        stats[p]["ok"] += 1
+                        stats[p]["items"] += len(old["items"])
+                        print("  ⟳ %-20s %-10s %5d 条  （沿用上一轮）%s"
+                              % (site["host"], p, len(old["items"]), err or ""))
+                        continue
+                    bad.append(site)
+                result[key] = {
+                    "site": sname or site["name"],
+                    "program": site["program"],
+                    "count": len(slim),
+                    "items": slim,
+                }
+                p = site["program"]
+                stats.setdefault(p, {"ok": 0, "fail": 0, "items": 0})
+                if err:
+                    stats[p]["fail"] += 1
+                    if not slim:
+                        print("  ✗ %-20s %-10s %s" % (site["host"], p, err))
+                else:
                     stats[p]["ok"] += 1
-                    stats[p]["items"] += len(old["items"])
-                    print("  ⟳ %-20s %-10s %5d 条  （沿用上一轮）%s"
-                          % (site["host"], p, len(old["items"]), err or ""))
-                    continue
-            result[key] = {
-                "site": sname or site["name"],
-                "program": site["program"],
-                "count": len(slim),
-                "items": slim,
-            }
-            p = site["program"]
-            stats.setdefault(p, {"ok": 0, "fail": 0, "items": 0})
-            if err:
-                stats[p]["fail"] += 1
-                print("  ✗ %-20s %-10s %s" % (site["host"], p, err))
-            else:
-                stats[p]["ok"] += 1
-                stats[p]["items"] += len(items)
-                print("  ✓ %-20s %-10s %5d 条  %s" % (site["host"], p, len(items), sname or ""))
+                    stats[p]["items"] += len(items)
+                    print("  ✓ %-20s %-10s %5d 条  %s" % (site["host"], p, len(items), sname or ""))
+        return bad
+
+    bad = run_batch(sites, SITE_WORKERS)
+    if bad:
+        print("\n=== 二次重试：%d 个失败站点（低并发 + 更宽松的等待）===" % len(bad))
+        bad2 = run_batch(bad, RETRY_WORKERS)
+        if bad2:
+            print("  仍失败 %d 站：%s" % (len(bad2), ", ".join(s["host"] for s in bad2)))
 
     print("\n=== 汇总（%.1fs）===" % (time.time() - t0))
     total = 0
@@ -490,11 +515,15 @@ def main():
         print("  %-10s 成功 %d / 失败 %d   商品 %d" % (p, s["ok"], s["fail"], s["items"]))
         total += s["items"]
     print("  合计商品 %d 条" % total)
-    if reused:
-        print("  其中 %d 站沿用上一轮（源站临时不可用）" % reused)
+    if reused[0]:
+        print("  其中 %d 站沿用上一轮（源站临时不可用）" % reused[0])
 
     out = {
-        "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        # 2026-10-06：统一按北京时间（UTC+8）落时间。
+        # 原来用系统本地时间，GitHub runner 是 UTC → 网站显示比实际早 8 小时，
+        # 看起来像"数据旧了半天"。用 utcnow()+8h，本机与云端结果一致。
+        "scraped_at": (datetime.datetime.utcnow()
+                       + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S"),
         "ts": int(time.time() * 1000),
         "sites": len(result),
         "total_items": total,
