@@ -3,6 +3,3 @@
 /site/
 __pycache__/
 *.pyc
-
-# 临时探测结果（验证完删除）
-probe-result.txt

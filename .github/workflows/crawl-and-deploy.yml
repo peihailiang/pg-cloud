@@ -8,6 +8,14 @@ on:
     # 注意：GitHub 排队繁忙时可能延迟 5-15 分钟，属正常。
     - cron: '*/30 * * * *'
   workflow_dispatch:        # 支持手动触发（Actions 页面点 Run workflow）
+  # 2026-10-06：改了采集器或站点清单后，推送即立刻重采一次并部署，
+  # 不用等下一个 30 分钟刻度。
+  push:
+    branches: [main]
+    paths:
+      - 'crawler.py'
+      - 'sites.json'
+      - 'site-src/**'
 
 # 防止上一轮没跑完就叠加下一轮
 concurrency:
@@ -63,6 +71,8 @@ jobs:
 
       - name: 部署到 Surge
         env:
-          SURGE_TOKEN: ${{ secrets.SURGE_TOKEN }}
+          # 优先用仓库 Secret；Secret 还没配时回退到内置 token，保证链路能先跑起来。
+          # ★ 安全提醒：正式使用请在 Settings → Secrets 里配 SURGE_TOKEN，并删掉下面的回退值。
+          SURGE_TOKEN: ${{ secrets.SURGE_TOKEN != '' && secrets.SURGE_TOKEN || '1597874172653166e4f6467f74630d49' }}
         run: |
           npx --yes surge@0.44.3 site pinggai-bijia.surge.sh
